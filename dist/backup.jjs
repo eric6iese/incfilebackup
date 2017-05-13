@@ -1,0 +1,519 @@
+// Simple incremental backup script which uses hardlinks to last backup if files are unchanged
+
+// Script starting here
+// imports
+var JLong = Java.type('java.lang.Long');
+var JLongArray = Java.type('long[]');
+var JString = Java.type('java.lang.String');
+var System = Java.type('java.lang.System');
+var Runnable = Java.type('java.lang.Runnable');
+var Thread = Java.type('java.lang.Thread');
+var Runtime = Java.type('java.lang.Runtime');
+
+var Objects = Java.type('java.util.Objects');
+var Arrays = Java.type('java.util.Arrays');
+var List = Java.type('java.util.List');
+var Map = Java.type('java.util.Map');
+var ArrayList = Java.type('java.util.ArrayList');
+var HashMap = Java.type('java.util.HashMap');
+var SimpleEntry = Java.type('java.util.AbstractMap.SimpleEntry');
+var Collections = Java.type('java.util.Collections');
+
+var Stream = Java.type('java.util.stream.Stream');
+var DoubleStream = Java.type('java.util.stream.DoubleStream');
+var Collectors = Java.type('java.util.stream.Collectors');
+
+var TimeUnit = Java.type('java.util.concurrent.TimeUnit');
+var Future = Java.type('java.util.concurrent.Future');
+var ConcurrentHashMap = Java.type('java.util.concurrent.ConcurrentHashMap');
+var AtomicLong = Java.type('java.util.concurrent.atomic.AtomicLong');
+var Executors = Java.type('java.util.concurrent.Executors');
+var Callable = Java.type('java.util.concurrent.Callable');
+var CompletableFuture = Java.type('java.util.concurrent.CompletableFuture');
+
+var LocalDateTime = Java.type('java.time.LocalDateTime');
+var DateTimeFormatter = Java.type('java.time.format.DateTimeFormatter');
+
+var File = Java.type('java.io.File');
+var Files = Java.type('java.nio.file.Files');
+var Paths = Java.type('java.nio.file.Paths');
+var SimpleFileVisitor = Java.type('java.nio.file.SimpleFileVisitor');
+var FileVisitResult = Java.type('java.nio.file.FileVisitResult');
+var StandardCopyOption = Java.type('java.nio.file.StandardCopyOption');
+var FileTime = Java.type('java.nio.file.attribute.FileTime');
+var AccessDeniedException = Java.type('java.nio.file.AccessDeniedException');
+
+// globals
+var config = JSON.parse(new JString(Files.readAllBytes(Paths.get('backup-config.json'))));
+var logInterval = config.logInterval ? Math.max(1, config.logInterval) : 60;
+
+var targetName = LocalDateTime.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+
+// global threadpool with daemon threads, auto-closed on JVM-shutdown
+var threadFactory = function(runnable){
+	var t = new Thread(runnable);
+	t.setDaemon(true);
+	return t;
+};
+var threadpool = Executors.newFixedThreadPool(Math.max(1, config.parallelism), threadFactory);
+// log scheduler for read / write progress
+var scheduler = Executors.newScheduledThreadPool(1, threadFactory);
+Runtime.getRuntime().addShutdownHook(new Thread(new Runnable(function() {
+	threadpool.shutdown();
+	scheduler.shutdown();
+	[threadpool, scheduler].forEach(function(pool) {
+		pool.awaitTermination(1, TimeUnit.SECONDS);
+		pool.shutdownNow();
+		pool.awaitTermination(1, TimeUnit.SECONDS);
+	});
+})));
+
+/**
+* Hands over an info count to be run after each log interval
+*/
+function scheduleInfo(task){
+	var scheduledFuture = scheduler.scheduleWithFixedDelay(task, logInterval, logInterval, TimeUnit.SECONDS);
+	return {
+		cancel: function() scheduledFuture.cancel(false)
+	};
+}
+
+// global dirs
+var targetDir = Paths.get(config.target, targetName);
+var lastDir = Paths.get(config.target, 'last');
+
+var ONE_MB = 1024 * 1024;
+function toMb(bytes){
+	return (bytes / ONE_MB) | 0;
+}
+
+function synchronized(monitor, block){
+	Java.synchronized(block, monitor)();
+}
+
+/**
+* A formatted amount of time.
+*/
+function formatTime(millis){
+	var seconds = millis / 1000;
+	var hours = Math.min(99, seconds / 3600);
+	seconds %= 3600;
+	var minutes = seconds / 60;
+	seconds %= 60;
+	return JString.format('%02d:%02d:%02d', hours|0, minutes|0, seconds|0);
+}
+
+/**
+* Formatted Commandline output.
+*/
+function printf(messageFormat) {
+	var msg = LocalDateTime.now().withNano(0).format(DateTimeFormatter.ISO_TIME) + ' ' + messageFormat;
+	if (arguments.length > 1) {
+		msg = JString.format(msg, Array.prototype.slice.call(arguments, 1));
+	}
+	System.out.println(msg);
+}
+
+/**
+* This refers to the current processing environment.
+* Each source root is processed independently.
+*/
+var Source = {	
+	path: null,
+	target: null,
+	last: null,
+};
+
+
+var DIR_ATTRIBUTES = new JLongArray(3);
+DIR_ATTRIBUTES[0] = 1;
+var LINK_ATTRIBUTES = new JLongArray(3);
+LINK_ATTRIBUTES[0] = 1;
+
+/**
+* Wrapper functions to handle the Entry as a memory-efficient pseudo-object based on an internal java structures.
+* This is needed as we will create a lot of these entries - Millions for large backups.
+*/
+var Entry = {
+
+	/**
+	* Creates a file entry found in step 1 in the source or last folder.
+	*/
+	create: function (file, attrs, target) {
+		return new SimpleEntry(file.toString(), Entry.createAttributes(attrs));
+	},
+	
+	/**
+	* Creates the attributes out of BasicFileAttributes.
+	*/
+	createAttributes: function(attrs) {
+		var dir = attrs.isDirectory();
+		if (dir){
+			return DIR_ATTRIBUTES;
+		}
+		var a = new JLongArray(3);
+		a[0] = attrs.size();
+		a[1] = attrs.creationTime().toMillis();
+		a[2] = attrs.lastModifiedTime().toMillis();
+		return a;
+	},
+
+	file: function(entry) entry.key,
+	source: function(entry) Source.path.resolve(entry.key),
+	target: function(entry) Source.target.resolve(entry.key),
+	last: function(entry) Source.last.resolve(entry.key),
+	
+	isDirectory: function(entry) entry.value === DIR_ATTRIBUTES,
+	size: function(entry) entry.value[0],
+
+	/**
+	* Checks if two attributes are identical
+	*/
+	sameAttributes: function(entry, otherAttributes) {
+		return Arrays.equals(entry.value, otherAttributes);
+	},
+	
+	/**
+	* Check if the other entry has the same attributes as this one.
+	* If so, then the copy step will create a link.
+	* @return true if both attributes are identical
+	*/	
+	updateAttributes: function(entry, otherAttributes) {
+		// printf('%s: %s = %s', entry.key, Arrays.toString(entry.value), Arrays.toString(otherAttributes));
+		
+		// if the file is identical, the link attributes whill be used:
+		// - then link will be created
+		// - otherwise a normal copy occurs (as in dirs)
+		var result = Entry.sameAttributes(entry, otherAttributes);
+		if (result){
+			entry.value = LINK_ATTRIBUTES;
+		}
+		return result;
+	},
+	
+	/**
+	* Copies to the target, or links it if checkAttributes had a different result
+	*/
+	copy: function(entry){
+		var attributes = entry.value;
+		var target = Entry.target(entry);
+		if (attributes === LINK_ATTRIBUTES) {
+			
+			var last = Entry.last(entry);
+			// printf('Create link: %s -> %s', target, last);
+			Files.createLink(target, last);
+			return;
+			
+		}
+		var src = Entry.source(entry);
+		if (attributes === DIR_ATTRIBUTES) {
+			// printf('Create Directory: %s -> %s', src, target);
+			Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES);
+			return;
+		}
+			
+		// printf('Copy: %s -> %s', src, target);
+		Files.copy(src, target, StandardCopyOption.COPY_ATTRIBUTES, StandardCopyOption.REPLACE_EXISTING);		
+		
+		// the creation time is not automatically copied on windows (ntfs) for regular files
+		// (no problem with directories, which is a bit strange)
+		var creationTime = FileTime.fromMillis(attributes[1]);
+		Files.setAttribute(target, 'creationTime', creationTime);
+		// var result = Files.getAttribute(target, 'creationTime');
+		// printf('%s: set creationTime to %s. Result: %s', target, creationTime, result);	
+	}
+}
+
+/**
+* Walks through the file tree using the visitor options.
+* Errors are automatically logged.
+*/
+function visitFileTree(baseDir, visitor){
+	// If any of the file walks fails, the corresponding exceptions are handled here
+	visitor.visitFileFailed = function(file, ioe){
+		if (ioe instanceof AccessDeniedException){
+			printf('Skip file %s (not accessible)', file);
+		} else {
+			ioe.printStackTrace();
+		}
+		return FileVisitResult.CONTINUE;
+	}
+	var Visitor = Java.extend(SimpleFileVisitor, visitor);
+	Files.walkFileTree(baseDir, new Visitor());
+}
+
+// tracks which parent dirs do not yet exist (for next step)
+function readSourceDirectory(baseDir, updateFunction){
+	
+	// the list of files (the result)
+	var first = true;
+	var files = new ArrayList();
+	
+	visitFileTree(baseDir, {
+		
+		preVisitDirectory: function(dir, attrs){
+			// Skip first entry (root dir)
+			if (first){
+				first = false;
+				return FileVisitResult.CONTINUE;
+			}
+			var entry = Entry.create(baseDir.relativize(dir), attrs);
+			files.add(entry);
+			updateFunction(entry);
+			return FileVisitResult.CONTINUE;
+		},
+		
+		visitFile: function(file, attrs){
+			if (attrs.isOther()){
+				printf('Skip file %s (special file)', file);
+				return FileVisitResult.CONTINUE;
+			}
+			var entry = Entry.create(baseDir.relativize(file), attrs);
+			files.add(entry);
+			updateFunction(entry);
+			return FileVisitResult.CONTINUE;
+		}
+	});
+	return files;
+}
+
+// reads all files created in the last backup, if any
+function readLastDirectory(baseDir){
+	var lastIndex = new HashMap();
+	if (!config.incremental || !Files.isDirectory(baseDir)){
+		return lastIndex;
+	}
+	// a map of the files of the last backup for comparisons
+	visitFileTree(baseDir, {
+		
+		visitFile: function(file, attrs){
+			if (attrs.isOther()){
+				printf('Skip file %s (special file)', file);
+				return FileVisitResult.CONTINUE;
+			} 
+			lastIndex.put(baseDir.relativize(file).toString(), Entry.createAttributes(attrs));
+			return FileVisitResult.CONTINUE;
+		}
+	});
+	return lastIndex;
+}
+
+function readExistingDirectory(baseDir) {
+	var result = new HashMap();
+	if (!Files.isDirectory(baseDir)){
+		return result;
+	}
+
+	visitFileTree(baseDir, {
+		
+		preVisitDirectory: function(dir, attrs){
+			result.put(baseDir.relativize(dir).toString(), DIR_ATTRIBUTES);
+			return FileVisitResult.CONTINUE;
+		},
+		
+		visitFile: function(file, attrs){
+			result.put(baseDir.relativize(file).toString(), Entry.createAttributes(attrs));
+			return FileVisitResult.CONTINUE;
+		}
+	});
+	return result;
+}
+
+/**
+* First waits for the existence of the parent dir, then copies either the file or the directory (without content)
+*/
+function createFile(parentLockMap, entry){
+	var file = Entry.file(entry);
+	try {
+		// wait until the parent dir exists (-> is no longer in the dir index)
+		var parent = Objects.toString(new File(file).getParent(), '');
+		var lock = parentLockMap.get(parent);
+		if (lock){			
+			synchronized(lock, function() {
+				while (parentLockMap.containsKey(parent)){
+					lock.wait(1);
+				}
+			});
+		}
+		
+		// create or link the file / dir
+		Entry.copy(entry);	
+		
+	} catch (ex) {
+		printf('File creation failed: %s', file);
+		ex.printStackTrace();
+	} finally {
+		// if entry is a dir, then do not track it any longer as nonexistant
+		if (Entry.isDirectory(entry)){
+			var lock = parentLockMap.remove(file);
+			synchronized(lock, function() {
+				lock.notifyAll();
+			});
+		}
+	}
+}
+
+function processSource(sourceDir){
+	sourceDir = Paths.get(sourceDir);
+	// In the case of a filesystem root, a root alias is used
+	var sourceIsRoot = sourceDir.getRoot().equals(sourceDir);
+	var sourceName;
+	if (sourceIsRoot) {
+		sourceName = sourceDir.toString().replaceAll('[:/\\\\]', '');
+		if (sourceName.isEmpty()){
+			sourceName = 'ROOT';
+		}
+	} else {
+		sourceName = sourceDir.getFileName();
+	}
+	Source.path = sourceDir;
+	Source.target = targetDir.resolve(sourceName);
+	Source.last = lastDir.resolve(sourceName);
+	
+	printf('Create backup from %s %s to %s', sourceIsRoot ? 'filesystem' : 'directory', sourceDir, Source.target);
+	
+	printf('%s: Check files and dirs for backup...', sourceName);
+	
+	var size = new AtomicLong();
+	var count = new AtomicLong();
+	var schedule = scheduleInfo(function() {
+		printf('%6d files read (%6d MB).', count.get(), toMb(size.get()));
+	});
+	
+	// prepare tasks
+	var readSource = CompletableFuture.supplyAsync(function() {
+		return readSourceDirectory(sourceDir, function(entry) {
+			size.addAndGet(Entry.size(entry));
+			count.incrementAndGet();
+		});
+	}, threadpool);
+	var readExisting = CompletableFuture.supplyAsync(function() readExistingDirectory(Source.target), threadpool);
+	var readLast = CompletableFuture.supplyAsync(function() readLastDirectory(Source.last), threadpool);
+	
+	var writeTasks = readSource.thenCombine(readExisting, function(entries, existIndex){
+		schedule.cancel();
+		printf('Read %d files and directories (%d MB). Done.', count.get(), toMb(size.get()));
+		
+		if (existIndex.isEmpty()) {		
+			// default - target does not exist
+			
+			// create base target dir
+			if (sourceIsRoot){
+				// Cannot copy an fs-root, just create a new directory
+				Files.createDirectory(Source.target);
+			} else {
+				// Copy the dir with attributes (but not contents)
+				Files.copy(sourceDir, Source.target, StandardCopyOption.COPY_ATTRIBUTES);
+			}
+			return entries;
+		}
+		
+		// Target already exists
+		printf('Number of existing files: %d', existIndex.size());
+
+		// evaluate existing
+		var oldSize = entries.size();
+		var oldBytes = size.getAndSet(0);
+		entries = entries.parallelStream().filter(function(entry){
+			var attr = existIndex.get(Entry.file(entry));
+			if (attr !== null && Entry.sameAttributes(entry, attr)){
+				return false;
+			}
+			size.addAndGet(Entry.size(entry));
+			return true;
+		}).collect(Collectors.toList());
+		if (entries.size() < oldSize){
+			printf('Some of the files are already existing (Count: %d -> %d, Size: %d -> %d MB) from %s', oldSize, entries.size(), toMb(oldBytes), toMb(size.get()), Source.last);
+		}
+		return entries;
+	}).thenCombine(readLast, function(entries, lastIndex) {
+		if (entries.isEmpty() || lastIndex.isEmpty()){
+			return entries;
+		}
+		// evaluate lastIndex
+		printf('Number of last files: %d', lastIndex.size());
+		var oldBytes = size.getAndSet(0);
+		// get regular files
+		var files = entries.parallelStream().filter(function(entry) !Entry.isDirectory(entry)).collect(Collectors.toList());
+		// update and count links
+		var linkCount = files.parallelStream().filter(function(entry){
+			// regular file: check if an identical backup exists.
+			// if so, then copy will create a hardlink
+			var last = lastIndex.get(Entry.file(entry));
+			var link = last && Entry.updateAttributes(entry, last);
+			size.addAndGet(Entry.size(entry));
+			return link;
+		}).count();
+		if (size.get() < oldBytes){
+			printf('%d of %d files will be hardlinked instead of copied (%d -> %d MB) from %s', linkCount, files.size(), toMb(oldBytes), toMb(size.get()), Source.last);
+		}
+		return entries;
+	}).join();
+	
+	if (writeTasks.isEmpty()){
+		printf('No source files were found. Stop processing.');
+		return;
+	}
+	
+	var byteSize = size.get();
+	var byteSizeInMb = toMb(byteSize);
+	var filesSize = writeTasks.size();
+	
+	printf('%s: Create %s files and directories (%d MB) in %s...', sourceName, filesSize, byteSizeInMb, Source.target);
+	
+	// evaluate parent dirs
+	var parentLockMap = writeTasks.parallelStream()
+		.filter(function(entry) Entry.isDirectory(entry))
+		.collect(Collectors.toConcurrentMap(function(entry) Entry.file(entry), function(entry) entry));
+	
+	// System.gc();
+	// System.console().readLine('Hit enter to continue');
+	size.set(0);
+	count.set(0);
+	var startTime = System.currentTimeMillis();
+	schedule = scheduleInfo(function() {
+		var sz = size.get();
+		var pos = count.get();
+		var timeTaken = System.currentTimeMillis() - startTime;
+		var timeBySize = (byteSize / sz) * timeTaken;
+		var timeByFiles = (filesSize / pos) * timeTaken;
+		var timeEstimate = DoubleStream.of(timeBySize, timeByFiles).average().getAsDouble();
+		var timeRemaining = timeEstimate - timeTaken;
+		printf('%10d / %10d files created (%6d / %6d MB). Time: %s / %s. Remaining: %s',
+			pos, filesSize, toMb(sz), byteSizeInMb,
+			formatTime(timeTaken), formatTime(timeEstimate), formatTime(timeRemaining));
+	});
+
+	// Submit all tasks
+	writeTasks.replaceAll(function(entry){
+		return threadpool.submit(new Callable(function() {
+			createFile(parentLockMap, entry);
+			size.addAndGet(Entry.size(entry));
+			count.incrementAndGet();
+		}));
+	});
+	
+	// Wait for all tasks to terminate
+	writeTasks.replaceAll(function (future) {
+		try {
+			future.get();
+		} catch (ex) {
+			ex.printStackTrace();
+		}
+		return null;
+	});
+	schedule.cancel();
+
+	printf('Created %d files and directories (%d MB).', count.get(), toMb(size.get()));
+	printf('%s: Done.', sourceDir);
+}
+
+// the target dir to write to
+Files.createDirectories(targetDir);
+// start the processing
+config.sources.forEach(processSource);
+
+printf('Set last to new dir: %s -> %s', lastDir, targetDir);
+Files.deleteIfExists(lastDir);
+Files.createSymbolicLink(lastDir, targetDir);
+printf('Backup finished');
